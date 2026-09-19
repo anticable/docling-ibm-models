@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import statistics
 
 import docling_ibm_models.tableformer.settings as s
@@ -19,6 +20,9 @@ class MatchingPostProcessor:
     def __init__(self, config):
         self._config = config
         self._cell_matcher = CellMatcher(config)
+        self._preserve_supported_empty_cells = os.environ.get(
+            "CC_TABLEFORMER_EMPTY_CELL_PRESERVATION", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
     def _log(self):
         # Setup a custom logger
@@ -462,6 +466,160 @@ class MatchingPostProcessor:
 
         overlapping_indexes, table_cells = find_overlapping_pairs_indexes(table_cells)
         return table_cells
+
+    @staticmethod
+    def _cell_slots(cell):
+        """Return every minimal-grid slot occupied by a structural cell."""
+
+        row = int(cell["row_id"])
+        column = int(cell["column_id"])
+        rowspan = int(cell.get("rowspan_val", 1))
+        colspan = int(cell.get("colspan_val", 1))
+        return {
+            (row_index, column_index)
+            for row_index in range(row, row + rowspan)
+            for column_index in range(column, column + colspan)
+        }
+
+    @staticmethod
+    def _median_bbox_bounds(cells):
+        return [
+            statistics.median(cell["bbox"][0] for cell in cells),
+            statistics.median(cell["bbox"][1] for cell in cells),
+            statistics.median(cell["bbox"][2] for cell in cells),
+            statistics.median(cell["bbox"][3] for cell in cells),
+        ]
+
+    def _align_unmatched_cell_to_surviving_grid(self, candidate, aligned_cells):
+        """Infer an empty cell bbox from already PDF-aligned row/column neighbours.
+
+        An unmatched structural cell has no PDF token bbox of its own.  It must
+        therefore not fall back to the raw model bbox.  This method only returns
+        a bbox when both its surviving row bands and column bands can be inferred
+        from cells that have already passed the normal alignment path.
+        """
+
+        slots = self._cell_slots(candidate)
+        rows = sorted({row for row, _ in slots})
+        columns = sorted({column for _, column in slots})
+        if not rows or not columns:
+            return None
+
+        column_bounds = []
+        for column in columns:
+            column_cells = [
+                cell
+                for cell in aligned_cells
+                if column in {column_index for _, column_index in self._cell_slots(cell)}
+            ]
+            exact_column_cells = [
+                cell
+                for cell in column_cells
+                if int(cell.get("column_id", -1)) == column
+                and int(cell.get("colspan_val", 1)) == 1
+            ]
+            if exact_column_cells:
+                column_cells = exact_column_cells
+            if not column_cells:
+                return None
+            column_bounds.append(self._median_bbox_bounds(column_cells))
+
+        row_bounds = []
+        for row in rows:
+            row_cells = [
+                cell
+                for cell in aligned_cells
+                if row in {row_index for row_index, _ in self._cell_slots(cell)}
+            ]
+            exact_row_cells = [
+                cell
+                for cell in row_cells
+                if int(cell.get("row_id", -1)) == row
+                and int(cell.get("rowspan_val", 1)) == 1
+            ]
+            if exact_row_cells:
+                row_cells = exact_row_cells
+            if not row_cells:
+                return None
+            row_bounds.append(self._median_bbox_bounds(row_cells))
+
+        bbox = [
+            min(bounds[0] for bounds in column_bounds),
+            min(bounds[1] for bounds in row_bounds),
+            max(bounds[2] for bounds in column_bounds),
+            max(bounds[3] for bounds in row_bounds),
+        ]
+        if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            return None
+        return bbox
+
+    def _retain_supported_empty_cells(
+        self, raw_empty_cell_ids, candidate_cells, aligned_cells
+    ):
+        """Retain deduplicated empty cells supported by the surviving grid.
+
+        Candidates come from the post-alignment/dedup list, not the raw model
+        list.  This keeps real cell IDs and normal structural metadata while
+        ensuring that a preserved cell gets a PDF-aligned grid bbox rather than
+        its original model bbox.  Unsupported rows/columns and occupied slots
+        are deliberately excluded.
+        """
+
+        if not self._preserve_supported_empty_cells:
+            return [], []
+
+        raw_empty_cell_ids = {int(cell_id) for cell_id in raw_empty_cell_ids}
+        represented_ids = {int(cell["cell_id"]) for cell in aligned_cells}
+        occupied_slots = set()
+        for cell in aligned_cells:
+            occupied_slots.update(self._cell_slots(cell))
+        supported_rows = {row for row, _ in occupied_slots}
+        supported_columns = {column for _, column in occupied_slots}
+
+        candidates = sorted(
+            (
+                cell
+                for cell in candidate_cells
+                if int(cell["cell_id"]) in raw_empty_cell_ids
+                and int(cell["cell_id"]) not in represented_ids
+            ),
+            key=lambda cell: (
+                int(cell["row_id"]),
+                int(cell["column_id"]),
+                int(cell["cell_id"]),
+            ),
+        )
+
+        retained = []
+        retained_ids = []
+        for candidate in candidates:
+            slots = self._cell_slots(candidate)
+            if not slots or slots & occupied_slots:
+                continue
+            if not all(row in supported_rows for row, _ in slots):
+                continue
+            if not all(column in supported_columns for _, column in slots):
+                continue
+
+            aligned_bbox = self._align_unmatched_cell_to_surviving_grid(
+                candidate, aligned_cells
+            )
+            if aligned_bbox is None:
+                self._log().debug(
+                    "Skipping unmatched empty cell %s because its PDF-aligned grid bbox is unsupported",
+                    candidate["cell_id"],
+                )
+                continue
+
+            preserved = candidate.copy()
+            preserved["bbox"] = aligned_bbox
+            preserved["_cc_preserved_empty"] = True
+            retained.append(preserved)
+            retained_ids.append(int(preserved["cell_id"]))
+            occupied_slots.update(slots)
+            represented_ids.add(int(preserved["cell_id"]))
+
+        return retained, retained_ids
 
     def _align_table_cells_to_pdf(self, table_cells, pdf_cells, matches):
         """
@@ -1186,6 +1344,11 @@ class MatchingPostProcessor:
 
         self._log().debug("Start prediction post-processing...")
         table_cells = matching_details["table_cells"]
+        raw_empty_cell_ids = {
+            int(cell["cell_id"])
+            for cell in table_cells
+            if int(cell.get("cell_class", 0)) <= 1
+        }
         pdf_cells = self._clear_pdf_cells(matching_details["pdf_cells"])
         matches = matching_details["matches"]
 
@@ -1308,6 +1471,19 @@ class MatchingPostProcessor:
                 dedupl_table_cells_sorted, pdf_cells, final_matches
             )
 
+        preserved_empty_cells, preserved_empty_cell_ids = (
+            self._retain_supported_empty_cells(
+                raw_empty_cell_ids,
+                dedupl_table_cells_sorted,
+                aligned_table_cells2,
+            )
+        )
+        if preserved_empty_cells:
+            # These cells have survived the ordinary matcher alignment and
+            # deduplication path.  They are added before orphan handling and
+            # final overlap correction, so they do not bypass normal cleanup.
+            aligned_table_cells2.extend(preserved_empty_cells)
+
         # 9. Distance-match orphans
         po1, po2, po3 = self._pick_orphan_cells(
             tab_rows,
@@ -1365,6 +1541,7 @@ class MatchingPostProcessor:
         matching_details["table_cells"] = table_cells_wo
         matching_details["matches"] = final_matches_wo
         matching_details["pdf_cells"] = pdf_cells
+        matching_details["preserved_unmatched_cell_ids"] = preserved_empty_cell_ids
 
         self._log().debug("Done prediction matching and post-processing!")
         return matching_details

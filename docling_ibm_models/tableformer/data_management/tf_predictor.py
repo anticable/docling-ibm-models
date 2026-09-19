@@ -825,6 +825,7 @@ class TFPredictor:
         docling_output = self._generate_tf_response(
             matching_details["table_cells"],
             matching_details["matches"],
+            matching_details.get("preserved_unmatched_cell_ids", []),
         )
 
         AggProfiler().end("generate_docling_response", self._prof)
@@ -891,7 +892,9 @@ class TFPredictor:
             tf_cell_list.append(tf_cell)
         return tf_cell_list
 
-    def _generate_tf_response(self, table_cells, matches):
+    def _generate_tf_response(
+        self, table_cells, matches, preserved_unmatched_cell_ids=None
+    ):
         r"""
         Convert the matching details to the expected output for Docling
 
@@ -903,6 +906,9 @@ class TFPredictor:
         matches : dictionary of lists of table_cells
             A dictionary which is indexed by the pdf_cell_id as key and the value is a list
             of the table_cells that fall inside that pdf cell
+        preserved_unmatched_cell_ids : list of int, optional
+            Real structural cell IDs retained by the experimental empty-cell
+            path. These cells deliberately have no text-cell match.
 
         Returns
         -------
@@ -986,6 +992,56 @@ class TFPredictor:
             if len(l_labels) > 0:
                 tf_cell["label"] = l_labels[0]
             tf_cell_list.append(tf_cell)
+
+        matched_table_cell_ids = {
+            int(match["table_cell_id"])
+            for pdf_cell_matches in matches.values()
+            for match in pdf_cell_matches
+        }
+        preserved_ids = {
+            int(cell_id) for cell_id in (preserved_unmatched_cell_ids or [])
+        }
+        for table_cell in sorted(
+            table_cells,
+            key=lambda cell: (
+                int(cell["row_id"]),
+                int(cell["column_id"]),
+                int(cell["cell_id"]),
+            ),
+        ):
+            cell_id = int(table_cell["cell_id"])
+            if cell_id not in preserved_ids or cell_id in matched_table_cell_ids:
+                continue
+
+            rowspan_val = int(table_cell.get("rowspan_val", 1))
+            colspan_val = int(table_cell.get("colspan_val", 1))
+            bbox = table_cell["bbox"]
+            label = table_cell.get("label")
+            tf_cell_list.append(
+                {
+                    "cell_id": cell_id,
+                    "bbox": {
+                        "b": bbox[3],
+                        "l": bbox[0],
+                        "r": bbox[2],
+                        "t": bbox[1],
+                    },
+                    "row_span": rowspan_val,
+                    "col_span": colspan_val,
+                    "start_row_offset_idx": int(table_cell["row_id"]),
+                    "end_row_offset_idx": int(table_cell["row_id"]) + rowspan_val,
+                    "start_col_offset_idx": int(table_cell["column_id"]),
+                    "end_col_offset_idx": int(table_cell["column_id"]) + colspan_val,
+                    "indentation_level": 0,
+                    "text_cell_bboxes": [],
+                    "column_header": label == "ched",
+                    "row_header": label == "rhed",
+                    "row_section": label == "srow",
+                    "row_ids": [int(table_cell["row_id"])],
+                    "column_ids": [int(table_cell["column_id"])],
+                    "label": label if label is not None else "None",
+                }
+            )
         return tf_cell_list
 
     def _prepare_image(self, mat_image):
