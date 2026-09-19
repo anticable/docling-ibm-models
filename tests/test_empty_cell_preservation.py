@@ -30,7 +30,7 @@ def test_feature_is_off_by_default(monkeypatch):
     aligned = [_cell(1, 0, 0, [10, 10, 20, 20])]
     candidate = _cell(2, 0, 1, [100, 100, 101, 101], cell_class=0, label="ecel")
 
-    retained, retained_ids = processor._retain_supported_empty_cells(
+    retained, retained_ids = processor._retain_supported_unmatched_cells(
         {2}, aligned + [candidate], aligned
     )
 
@@ -45,9 +45,9 @@ def test_supported_empty_cell_uses_surviving_pdf_aligned_grid(monkeypatch):
         _cell(2, 0, 1, [20, 10, 30, 20]),
         _cell(3, 1, 0, [10, 20, 20, 30]),
     ]
-    candidate = _cell(4, 1, 1, [100, 100, 101, 101], cell_class=0, label="ecel")
+    candidate = _cell(4, 1, 1, [100, 100, 101, 101], cell_class=2, label="fcel")
 
-    retained, retained_ids = processor._retain_supported_empty_cells(
+    retained, retained_ids = processor._retain_supported_unmatched_cells(
         {4}, aligned + [candidate], aligned
     )
 
@@ -63,7 +63,7 @@ def test_unsupported_rows_and_columns_are_not_restored(monkeypatch):
     unsupported_row = _cell(2, 1, 0, [10, 20, 20, 30], cell_class=0, label="ecel")
     unsupported_column = _cell(3, 0, 1, [20, 10, 30, 20], cell_class=0, label="ecel")
 
-    retained, retained_ids = processor._retain_supported_empty_cells(
+    retained, retained_ids = processor._retain_supported_unmatched_cells(
         {2, 3}, aligned + [unsupported_row, unsupported_column], aligned
     )
 

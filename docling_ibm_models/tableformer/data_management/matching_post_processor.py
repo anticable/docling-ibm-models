@@ -553,10 +553,10 @@ class MatchingPostProcessor:
             return None
         return bbox
 
-    def _retain_supported_empty_cells(
-        self, raw_empty_cell_ids, candidate_cells, aligned_cells
+    def _retain_supported_unmatched_cells(
+        self, raw_structural_cell_ids, candidate_cells, aligned_cells
     ):
-        """Retain deduplicated empty cells supported by the surviving grid.
+        """Retain deduplicated unmatched structural cells supported by the surviving grid.
 
         Candidates come from the post-alignment/dedup list, not the raw model
         list.  This keeps real cell IDs and normal structural metadata while
@@ -568,7 +568,9 @@ class MatchingPostProcessor:
         if not self._preserve_supported_empty_cells:
             return [], []
 
-        raw_empty_cell_ids = {int(cell_id) for cell_id in raw_empty_cell_ids}
+        raw_structural_cell_ids = {
+            int(cell_id) for cell_id in raw_structural_cell_ids
+        }
         represented_ids = {int(cell["cell_id"]) for cell in aligned_cells}
         occupied_slots = set()
         for cell in aligned_cells:
@@ -580,7 +582,7 @@ class MatchingPostProcessor:
             (
                 cell
                 for cell in candidate_cells
-                if int(cell["cell_id"]) in raw_empty_cell_ids
+                if int(cell["cell_id"]) in raw_structural_cell_ids
                 and int(cell["cell_id"]) not in represented_ids
             ),
             key=lambda cell: (
@@ -1344,11 +1346,7 @@ class MatchingPostProcessor:
 
         self._log().debug("Start prediction post-processing...")
         table_cells = matching_details["table_cells"]
-        raw_empty_cell_ids = {
-            int(cell["cell_id"])
-            for cell in table_cells
-            if int(cell.get("cell_class", 0)) <= 1
-        }
+        raw_structural_cell_ids = {int(cell["cell_id"]) for cell in table_cells}
         pdf_cells = self._clear_pdf_cells(matching_details["pdf_cells"])
         matches = matching_details["matches"]
 
@@ -1472,8 +1470,8 @@ class MatchingPostProcessor:
             )
 
         preserved_empty_cells, preserved_empty_cell_ids = (
-            self._retain_supported_empty_cells(
-                raw_empty_cell_ids,
+            self._retain_supported_unmatched_cells(
+                raw_structural_cell_ids,
                 dedupl_table_cells_sorted,
                 aligned_table_cells2,
             )
